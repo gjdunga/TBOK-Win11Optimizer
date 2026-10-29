@@ -411,6 +411,16 @@ function Invoke-TempCleanup {
             try { Remove-Item -Path (Join-Path $_.FullName "$sub\*") -Recurse -Force -ErrorAction SilentlyContinue } catch { }
         }
     }
+    # WinINET cache for the machine/service accounts: Windows Update, CryptoAPI,
+    # activation and BITS all browse as SYSTEM/LocalService/NetworkService and
+    # cache here where no user ever sees it. Cache CONTENT only. We never delete
+    # the WebCache index DB (WebCacheV01.dat) or any INetCookies store: those
+    # hold the cache index and sign-in state, and removing them logs WinINET
+    # consumers out or forces a risky index rebuild. Clearing content alone just
+    # recaches on demand.
+    foreach ($acct in "$env:SystemRoot\System32\config\systemprofile","$env:SystemRoot\ServiceProfiles\LocalService","$env:SystemRoot\ServiceProfiles\NetworkService") {
+        try { Remove-Item -Path (Join-Path $acct 'AppData\Local\Microsoft\Windows\INetCache\*') -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+    }
     $pending = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
     if (-not $pending) {
         foreach ($svc in 'wuauserv','bits') { Stop-Service $svc -Force -ErrorAction SilentlyContinue }

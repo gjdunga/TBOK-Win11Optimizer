@@ -152,6 +152,23 @@ gate to apply:
   Explorer holds them, so the weekly SYSTEM pass mainly catches logged-off
   profiles. They rebuild automatically.
 
+### Internet / WinINET cache
+
+Temporary Internet Files are cleared as cache content only, never the index or
+the sign-in state. Per profile the temp pass clears `INetCache`, and the
+browser pass clears the Edge/Chrome/Firefox cache trees; the machine and
+service accounts (SYSTEM, LocalService, NetworkService) have their own
+`INetCache` cleared too, since Windows Update, CryptoAPI and BITS browse there
+as those accounts.
+
+Deliberately never touched, because this is what breaks things: the WebCache
+ESE index (`WebCacheV01.dat`), which is held open by the WebCache service and
+only indexes the cache (delete it and you risk corruption or a forced rebuild,
+and can drop WinINET auth state), and any cookie or credential store
+(`INetCookies`, the browsers' `Cookies`/`Login Data`), which is sign-in state,
+not junk. Clearing content alone recaches on demand with nothing lost; the
+stale index entries reconcile themselves on next use.
+
 ### `-ClearEventLogs` (opt-in, off by default)
 
 Home machines do not audit, and event logs already self-bound (Windows
