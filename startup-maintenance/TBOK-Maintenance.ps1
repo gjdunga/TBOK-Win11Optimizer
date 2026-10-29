@@ -38,6 +38,8 @@ param(
     [ValidateSet('Light', 'Heavy')]
     [string]$Mode = 'Light',
     [string]$LogDir = (Join-Path $env:ProgramData 'TBOK\Logs'),
+    [int]$RetentionDays = 30,
+    [switch]$SkipCrashDumps,
     [switch]$WhatIfOnly
 )
 
@@ -415,6 +417,69 @@ function Invoke-TempCleanup {
     } else { Write-Log 'INFO' 'reboot pending; left SoftwareDistribution alone' }
     Write-Log 'INFO' 'temp and log cleanup done'
 }
+function Remove-OldFiles {
+    # Delete files older than $Days under $Path. Files only, skips reparse
+    # points. Returns bytes freed. Never deletes event logs or $PatchCache$
+    # (callers do not pass those paths; this is the enforcement of record).
+    param([string]$Path,[int]$Days,[switch]$Recurse)
+    if (-not (Test-Path -LiteralPath $Path)) { return [int64]0 }
+    if ($Path -match 'winevt\\Logs' -or $Path -match 'Installer\\\$PatchCache\$') { return [int64]0 }
+    $cut = (Get-Date).AddDays(-$Days); $freed = [int64]0
+    $gci = @{ LiteralPath=$Path; File=$true; Force=$true; ErrorAction='SilentlyContinue' }
+    if ($Recurse) { $gci.Recurse = $true }
+    foreach ($f in (Get-ChildItem @gci)) {
+        if ($f.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+        if ($f.LastWriteTime -lt $cut) { $sz=$f.Length; try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; $freed += $sz } catch { } }
+    }
+    return $freed
+}
+function Remove-StaleFolder {
+    # Remove a whole leftover folder if it exists and has not been touched
+    # within $Days. Used for upgrade leftovers only.
+    param([string]$Path,[int]$Days)
+    if (-not (Test-Path -LiteralPath $Path)) { return [int64]0 }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $item -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return [int64]0 }
+    if ($item.LastWriteTime -ge (Get-Date).AddDays(-$Days)) { return [int64]0 }
+    $sz = Get-FolderSize $Path
+    try { Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop; return $sz } catch { return [int64]0 }
+}
+
+function Invoke-AgedCleanup {
+    param([int]$Days,[bool]$IncludeDumps)
+    $freed = [int64]0
+    # Windows log trees (text logs, ETL, CbsPersist cabs). Not event logs.
+    foreach ($p in "$env:SystemRoot\Logs","$env:SystemRoot\Panther","$env:SystemRoot\WinREAgent","$env:SystemDrive\`$WinREAgent") {
+        $freed += (Remove-OldFiles -Path $p -Days $Days -Recurse)
+    }
+    $freed += (Remove-OldFiles -Path "$env:SystemRoot\debug" -Days $Days)
+    # Windows Error Reporting: machine + per-user.
+    foreach ($sub in 'ReportQueue','ReportArchive','Temp') { $freed += (Remove-OldFiles -Path "$env:ProgramData\Microsoft\Windows\WER\$sub" -Days $Days -Recurse) }
+    Get-ChildItem "$env:SystemDrive\Users" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        foreach ($sub in 'ReportQueue','ReportArchive','Temp') { $freed += (Remove-OldFiles -Path (Join-Path $_.FullName "AppData\Local\Microsoft\Windows\WER\$sub") -Days $Days -Recurse) }
+    }
+    # Defender support logs, RetailDemo offline content, service-account temp.
+    $freed += (Remove-OldFiles -Path "$env:ProgramData\Microsoft\Windows Defender\Support" -Days $Days)
+    $freed += (Remove-OldFiles -Path "$env:ProgramData\Microsoft\Windows\RetailDemo\OfflineContent" -Days $Days -Recurse)
+    foreach ($svc in "$env:SystemRoot\ServiceProfiles\LocalService\AppData\Local\Temp","$env:SystemRoot\ServiceProfiles\NetworkService\AppData\Local\Temp","$env:SystemRoot\System32\config\systemprofile\AppData\Local\Temp") {
+        $freed += (Remove-OldFiles -Path $svc -Days $Days -Recurse)
+    }
+    # Upgrade leftovers (whole folders, only if stale).
+    foreach ($p in "$env:SystemDrive\Windows10Upgrade","$env:SystemDrive\`$GetCurrent","$env:SystemDrive\`$SysReset\Logs") {
+        $freed += (Remove-StaleFolder -Path $p -Days $Days)
+    }
+    # Crash dumps (age-gated, optional: MEMORY.DMP may be your only BSOD record).
+    if ($IncludeDumps) {
+        $freed += (Remove-OldFiles -Path "$env:SystemRoot\Minidump" -Days $Days -Recurse)
+        $freed += (Remove-OldFiles -Path "$env:SystemRoot\LiveKernelReports" -Days $Days -Recurse)
+        $md = "$env:SystemRoot\MEMORY.DMP"
+        if ((Test-Path -LiteralPath $md) -and ((Get-Item $md -Force).LastWriteTime -lt (Get-Date).AddDays(-$Days))) {
+            $sz=(Get-Item $md -Force).Length; try { Remove-Item -LiteralPath $md -Force -ErrorAction Stop; $freed += $sz } catch { }
+        }
+    }
+    Write-Log 'INFO' ("aged cleanup (older than $Days days): reclaimed {0:N1} MB. Event logs and `$PatchCache`$ left untouched by design." -f ($freed/1MB))
+}
+
 function Invoke-BrowserCacheCleanup {
     # Cache only. Never touches profile data, passwords, cookies, or the
     # Office/OneNote caches our earlier fixes protect.
@@ -493,6 +558,7 @@ if ($Mode -eq 'Heavy') {
     Invoke-Step 'Restore point (throttled)' { New-RestorePointThrottled }
     Invoke-Step 'Temp and log cleanup' { Invoke-TempCleanup }
     Invoke-Step 'Browser/Teams cache cleanup' { Invoke-BrowserCacheCleanup }
+    Invoke-Step 'Aged logs/reports/dumps cleanup' { Invoke-AgedCleanup $RetentionDays (-not $SkipCrashDumps) }
     Invoke-Step 'Component-store cleanup' { Invoke-ComponentCleanup }
     Invoke-Step 'SSD retrim / HDD defrag' { Invoke-SsdTrim }
     Invoke-Step 'Trim shadow copies to newest' { Invoke-ShadowTrim }

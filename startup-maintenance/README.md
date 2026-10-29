@@ -78,8 +78,48 @@ Tasks created: `TBOK Maintenance (Boot)`, `TBOK Maintenance (Weekly)`,
   is what guards against feature updates re-adding bloat.
 - **Heavy, weekly (and once at install):** Light, then services, hibernation
   policy, pagefile, system-wide registry, gaming, scheduled-task disabling,
-  restore point, temp/log/browser cleanup, component-store cleanup, SSD
-  retrim, shadow-copy trim to newest, Storage Sense.
+  restore point, temp/log/browser cleanup, aged log/report/dump cleanup,
+  component-store cleanup, SSD retrim, shadow-copy trim to newest, Storage
+  Sense.
+
+## Aged log/report/dump cleanup (Heavy)
+
+A conservative, age-gated sweep of stale system cruft that the temp pass and
+the original tool do not touch. Controlled by two params on
+`TBOK-Maintenance.ps1`:
+
+- `-RetentionDays <n>` (default 30): only items whose last-write time is older
+  than this are removed.
+- `-SkipCrashDumps`: leave crash dumps alone (see below).
+
+Removed (files older than the cutoff only, reparse points skipped):
+
+- Windows log trees: `%SystemRoot%\Logs` (CBS/DISM logs and CbsPersist*.cab),
+  `Panther`, `WinREAgent`, `%SystemDrive%\$WinREAgent`, and `%SystemRoot%\debug`.
+- Windows Error Reporting queues and archives, machine-wide and per profile.
+- Defender support logs, RetailDemo offline content, and the three built-in
+  service-account TEMP folders (LocalService, NetworkService, systemprofile).
+- Upgrade leftovers as whole folders, and only when stale:
+  `Windows10Upgrade`, `$GetCurrent`, `$SysReset\Logs`.
+- Crash dumps (`Minidump`, `LiveKernelReports`, `MEMORY.DMP`) **unless**
+  `-SkipCrashDumps` is set. These are age-gated like everything else, but a
+  recent `MEMORY.DMP` may be your only record of a bugcheck, so the switch
+  exists to preserve them.
+
+Deliberately NOT touched, at any age, because deleting them is unsafe or
+destroys forensic/servicing state:
+
+- Event logs (`%SystemRoot%\System32\winevt\Logs\*.evtx`). Enforced in code,
+  not just by omission.
+- `Installer\$PatchCache$` (needed for repair/uninstall of MSI products).
+  Also enforced in code.
+- Prefetch and the SRU database (handled by the carried-in network/perf fixes;
+  wiping them hurts, does not help).
+- WinSxS beyond what `StartComponentCleanup` does.
+- Pagefile, hiberfil, and `Windows.edb`.
+
+Every run logs the reclaimed MB and restates that event logs and
+`$PatchCache$` were left untouched.
 
 ## Coverage vs the original batch
 
@@ -90,7 +130,8 @@ Defender scan CPU, WPBT, Webview override, Edge block); telemetry
 minimization; debloat (Copilot, Bing, Widgets, WebExperience) via Appx; Recall
 policy; wasteful scheduled tasks; the full per-user list; gaming (HPET, HAGS,
 windowed-games, MMCS, chassis power plan and boost mode); cleanup (temp, logs,
-browser/Teams caches, component store, SSD trim, shadow trim); winget updates
+browser/Teams caches, aged logs/reports/dumps, component store, SSD trim,
+shadow trim); winget updates
 via the per-user logon task.
 
 Deliberately different from the original:
