@@ -106,11 +106,14 @@ Removed (files older than the cutoff only, reparse points skipped):
   recent `MEMORY.DMP` may be your only record of a bugcheck, so the switch
   exists to preserve them.
 
-Deliberately NOT touched, at any age, because deleting them is unsafe or
+Deliberately NOT touched by the age sweep, because deleting them is unsafe or
 destroys forensic/servicing state:
 
 - Event logs (`%SystemRoot%\System32\winevt\Logs\*.evtx`). Enforced in code,
-  not just by omission.
+  not just by omission. Age-gating by file date is meaningless for them anyway:
+  an active log's timestamp tracks its newest event, so it never reads as old,
+  and the Event Log service holds the files open so a plain delete fails. See
+  `-ClearEventLogs` below for the one lever that actually empties them.
 - `Installer\$PatchCache$` (needed for repair/uninstall of MSI products).
   Also enforced in code.
 - Prefetch and the SRU database (handled by the carried-in network/perf fixes;
@@ -120,6 +123,21 @@ destroys forensic/servicing state:
 
 Every run logs the reclaimed MB and restates that event logs and
 `$PatchCache$` were left untouched.
+
+### `-ClearEventLogs` (opt-in, off by default)
+
+Home machines do not audit, and event logs already self-bound (Windows
+overwrites oldest within a per-log size cap, roughly 20 MB each), so they are
+not where the disk space is. When you do want them emptied, `-ClearEventLogs`
+runs `wevtutil cl` across every enumerable channel through the Event Log
+service, which is the only way to clear the live, locked `.evtx` files.
+
+This switch is sharper than the rest of the sweep and is why it is opt-in:
+`wevtutil` clears a whole channel at once, so it is NOT age-gated. Every event
+in each cleared log is removed, including a crash or boot failure recorded
+minutes ago. Disabled and analytic/debug channels refuse the clear and are
+counted as skipped, which is expected, not an error. The default (switch
+absent) leaves all event logs alone.
 
 ## Coverage vs the original batch
 

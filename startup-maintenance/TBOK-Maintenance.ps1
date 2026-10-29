@@ -40,6 +40,7 @@ param(
     [string]$LogDir = (Join-Path $env:ProgramData 'TBOK\Logs'),
     [int]$RetentionDays = 30,
     [switch]$SkipCrashDumps,
+    [switch]$ClearEventLogs,
     [switch]$WhatIfOnly
 )
 
@@ -480,6 +481,26 @@ function Invoke-AgedCleanup {
     Write-Log 'INFO' ("aged cleanup (older than $Days days): reclaimed {0:N1} MB. Event logs and `$PatchCache`$ left untouched by design." -f ($freed/1MB))
 }
 
+function Invoke-ClearEventLogs {
+    # Empties Windows event logs through the Event Log service (wevtutil cl).
+    # This is the one lever that works on the live, locked .evtx files the
+    # aged sweep cannot touch. It is NOT age-gated: wevtutil clears a whole
+    # channel at once, so every event in each cleared log is gone, including
+    # ones written minutes ago. Opt-in only (-ClearEventLogs); a home box does
+    # not audit, but a just-recorded crash or boot failure goes with it, so
+    # this never runs unattended unless explicitly requested.
+    $wv = Join-Path $env:SystemRoot 'System32\wevtutil.exe'
+    if (-not (Test-Path -LiteralPath $wv)) { Write-Log 'WARN' 'wevtutil.exe not found; event-log clear skipped'; return }
+    $cleared = 0; $skipped = 0
+    foreach ($raw in (& $wv el 2>$null)) {
+        $lg = ("$raw").Trim()
+        if (-not $lg) { continue }
+        & $wv cl "$lg" 2>$null
+        if ($LASTEXITCODE -eq 0) { $cleared++ } else { $skipped++ }   # analytic/debug and disabled channels refuse; expected
+    }
+    Write-Log 'INFO' "event logs cleared: $cleared ok, $skipped skipped (disabled/analytic channels or in use). Not age-gated; all events in cleared logs removed."
+}
+
 function Invoke-BrowserCacheCleanup {
     # Cache only. Never touches profile data, passwords, cookies, or the
     # Office/OneNote caches our earlier fixes protect.
@@ -559,6 +580,7 @@ if ($Mode -eq 'Heavy') {
     Invoke-Step 'Temp and log cleanup' { Invoke-TempCleanup }
     Invoke-Step 'Browser/Teams cache cleanup' { Invoke-BrowserCacheCleanup }
     Invoke-Step 'Aged logs/reports/dumps cleanup' { Invoke-AgedCleanup $RetentionDays (-not $SkipCrashDumps) }
+    if ($ClearEventLogs) { Invoke-Step 'Clear event logs (opt-in)' { Invoke-ClearEventLogs } }
     Invoke-Step 'Component-store cleanup' { Invoke-ComponentCleanup }
     Invoke-Step 'SSD retrim / HDD defrag' { Invoke-SsdTrim }
     Invoke-Step 'Trim shadow copies to newest' { Invoke-ShadowTrim }
