@@ -79,8 +79,10 @@ Tasks created: `TBOK Maintenance (Boot)`, `TBOK Maintenance (Weekly)`,
 - **Heavy, weekly (and once at install):** Light, then services, hibernation
   policy, pagefile, system-wide registry, gaming, scheduled-task disabling,
   restore point, temp/log/browser cleanup, aged log/report/dump cleanup,
+  regenerating caches (Delivery Optimization, GPU shader, thumbnail/icon),
   component-store cleanup, SSD retrim, shadow-copy trim to newest, Storage
-  Sense.
+  Sense. Opt-in extras (`-ClearEventLogs`, `-EmptyRecycleBin`) run here too
+  when their switch is set.
 
 ## Aged log/report/dump cleanup (Heavy)
 
@@ -101,6 +103,15 @@ Removed (files older than the cutoff only, reparse points skipped):
   service-account TEMP folders (LocalService, NetworkService, systemprofile).
 - Upgrade leftovers as whole folders, and only when stale:
   `Windows10Upgrade`, `$GetCurrent`, `$SysReset\Logs`.
+- Protected upgrade trees, only when stale: `Windows.old`, `$Windows.~BT`,
+  `$Windows.~WS`. These are TrustedInstaller-owned with locked ACLs, so the
+  cleanup takes ownership (`takeown` + `icacls` to Administrators) before
+  removing; a plain delete as SYSTEM fails partway and leaves a stub. This is
+  the biggest single reclaim on an upgraded box (`Windows.old` alone is often
+  10+ GB). The age gate keeps an in-progress upgrade and the 10-day rollback
+  window safe: by the time the 30-day cutoff passes, rollback is already gone.
+- The tool's own logs under `%ProgramData%\TBOK\Logs`, past retention. The
+  current run's log is dated now, so it is never caught.
 - Crash dumps (`Minidump`, `LiveKernelReports`, `MEMORY.DMP`) **unless**
   `-SkipCrashDumps` is set. These are age-gated like everything else, but a
   recent `MEMORY.DMP` may be your only record of a bugcheck, so the switch
@@ -124,6 +135,23 @@ destroys forensic/servicing state:
 Every run logs the reclaimed MB and restates that event logs and
 `$PatchCache$` were left untouched.
 
+### Regenerating caches (not age-gated, cleared in full)
+
+Alongside the age-gated sweep, the Heavy pass clears a few caches that
+regenerate on demand, so there is no reason to keep stale copies and no age
+gate to apply:
+
+- Delivery Optimization peer cache, via the supported
+  `Delete-DeliveryOptimizationCache` cmdlet. It re-downloads update/Store
+  chunks on demand, so clearing it loses nothing.
+- Per-profile GPU shader caches (`D3DSCache`, NVIDIA `DXCache`/`GLCache`, AMD
+  `DxCache`/`DxcCache`). The only cost is a brief one-time shader recompile on
+  the next game launch.
+- Per-profile Explorer thumbnail and icon databases (`thumbcache_*.db`,
+  `iconcache_*.db`). These are skipped silently while a logged-on user's
+  Explorer holds them, so the weekly SYSTEM pass mainly catches logged-off
+  profiles. They rebuild automatically.
+
 ### `-ClearEventLogs` (opt-in, off by default)
 
 Home machines do not audit, and event logs already self-bound (Windows
@@ -139,6 +167,17 @@ minutes ago. Disabled and analytic/debug channels refuse the clear and are
 counted as skipped, which is expected, not an error. The default (switch
 absent) leaves all event logs alone.
 
+### `-EmptyRecycleBin` (opt-in, off by default)
+
+The Recycle Bin can hold GBs, but it is the user's undo-delete safety net, so
+emptying it unattended is a data-loss trap and never a default. When the
+switch is set, the Heavy pass purges only items that have been **in the bin
+longer than `-RetentionDays`**, not the whole bin. The in-bin age is read from
+each item's `$I` metadata file (created at deletion time), not from the `$R`
+data file (which keeps the original file's modified time), so a file that was
+old on disk but deleted yesterday is correctly kept. Both halves of a purged
+pair are removed together. Runs across every fixed drive's `$Recycle.Bin`.
+
 ## Coverage vs the original batch
 
 Covered: F8 menu; hibernation by chassis; pagefile sizing; the service plan
@@ -148,8 +187,9 @@ Defender scan CPU, WPBT, Webview override, Edge block); telemetry
 minimization; debloat (Copilot, Bing, Widgets, WebExperience) via Appx; Recall
 policy; wasteful scheduled tasks; the full per-user list; gaming (HPET, HAGS,
 windowed-games, MMCS, chassis power plan and boost mode); cleanup (temp, logs,
-browser/Teams caches, aged logs/reports/dumps, component store, SSD trim,
-shadow trim); winget updates
+browser/Teams caches, aged logs/reports/dumps, Windows.old and upgrade
+staging, Delivery Optimization and GPU/thumbnail caches, component store, SSD
+trim, shadow trim); winget updates
 via the per-user logon task.
 
 Deliberately different from the original:

@@ -41,6 +41,7 @@ param(
     [int]$RetentionDays = 30,
     [switch]$SkipCrashDumps,
     [switch]$ClearEventLogs,
+    [switch]$EmptyRecycleBin,
     [switch]$WhatIfOnly
 )
 
@@ -445,6 +446,24 @@ function Remove-StaleFolder {
     $sz = Get-FolderSize $Path
     try { Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop; return $sz } catch { return [int64]0 }
 }
+function Remove-ProtectedStaleFolder {
+    # For upgrade trees owned by TrustedInstaller/SYSTEM with locked-down ACLs
+    # (Windows.old, $Windows.~BT, $Windows.~WS). Age-gated like everything else.
+    # A plain recursive delete as SYSTEM fails partway on these and leaves a
+    # gutted stub, so we take ownership and grant Administrators first. Age gate
+    # keeps an in-progress upgrade (recent mtime) and the 10-day rollback window
+    # safe: by the time the default 30-day cutoff passes, rollback is long gone.
+    param([string]$Path,[int]$Days)
+    if (-not (Test-Path -LiteralPath $Path)) { return [int64]0 }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $item -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return [int64]0 }
+    if ($item.LastWriteTime -ge (Get-Date).AddDays(-$Days)) { return [int64]0 }
+    $sz = Get-FolderSize $Path
+    & takeown.exe /F "$Path" /R /A /D Y *>$null                       # /D Y assumes an English yes prompt
+    & icacls.exe "$Path" /grant "*S-1-5-32-544:(OI)(CI)F" /T /C *>$null  # Administrators
+    try { Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop; return $sz }
+    catch { Write-Log 'WARN' ("could not fully remove {0}: {1}" -f $Path, $_.Exception.Message); return [int64]0 }
+}
 
 function Invoke-AgedCleanup {
     param([int]$Days,[bool]$IncludeDumps)
@@ -469,6 +488,14 @@ function Invoke-AgedCleanup {
     foreach ($p in "$env:SystemDrive\Windows10Upgrade","$env:SystemDrive\`$GetCurrent","$env:SystemDrive\`$SysReset\Logs") {
         $freed += (Remove-StaleFolder -Path $p -Days $Days)
     }
+    # Protected upgrade trees (TrustedInstaller-owned): previous OS and feature-
+    # update staging. Biggest single reclaim on an upgraded box (can be 10+ GB).
+    foreach ($p in "$env:SystemDrive\Windows.old","$env:SystemDrive\`$Windows.~BT","$env:SystemDrive\`$Windows.~WS") {
+        $freed += (Remove-ProtectedStaleFolder -Path $p -Days $Days)
+    }
+    # Our own logs: rotate anything past retention. The live run's log is dated
+    # now, so the age gate never touches it.
+    $freed += (Remove-OldFiles -Path $script:LogDir -Days $Days)
     # Crash dumps (age-gated, optional: MEMORY.DMP may be your only BSOD record).
     if ($IncludeDumps) {
         $freed += (Remove-OldFiles -Path "$env:SystemRoot\Minidump" -Days $Days -Recurse)
@@ -479,6 +506,58 @@ function Invoke-AgedCleanup {
         }
     }
     Write-Log 'INFO' ("aged cleanup (older than $Days days): reclaimed {0:N1} MB. Event logs and `$PatchCache`$ left untouched by design." -f ($freed/1MB))
+}
+
+function Invoke-ExtraCleanup {
+    # Non-age-gated but safe: caches that regenerate on demand, cleared in full.
+    # Delivery Optimization peer cache (supported cmdlet; re-downloads if needed).
+    try {
+        if (Get-Command Delete-DeliveryOptimizationCache -ErrorAction SilentlyContinue) {
+            Delete-DeliveryOptimizationCache -Force -ErrorAction SilentlyContinue
+            Write-Log 'INFO' 'delivery optimization cache cleared'
+        }
+    } catch { }
+    # Per-profile GPU shader caches and Explorer thumb/icon databases. These
+    # regenerate; the only cost is a brief first-use shader recompile. The db
+    # files are skipped silently when a logged-on user's Explorer holds them.
+    Get-ChildItem "$env:SystemDrive\Users" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        $la = Join-Path $_.FullName 'AppData\Local'
+        foreach ($c in 'D3DSCache','NVIDIA\DXCache','NVIDIA\GLCache','AMD\DxCache','AMD\DxcCache') {
+            try { Remove-Item -Path (Join-Path $la "$c\*") -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+        }
+        $expl = Join-Path $la 'Microsoft\Windows\Explorer'
+        foreach ($g in 'thumbcache_*.db','iconcache_*.db') {
+            try { Remove-Item -Path (Join-Path $expl $g) -Force -ErrorAction SilentlyContinue } catch { }
+        }
+    }
+    Write-Log 'INFO' 'shader and thumbnail caches cleared where not in use'
+}
+
+function Invoke-EmptyRecycleBin {
+    # Opt-in (-EmptyRecycleBin). The bin is the user's undo-delete safety net, so
+    # this is never a default and it only purges items that have been IN the bin
+    # longer than $Days, not the whole bin. The in-bin age lives on the $I<id>
+    # metadata file (created at deletion time), not on $R<id> (which keeps the
+    # original file's mtime), so we gate on $I and remove the matching $R with it.
+    param([int]$Days)
+    $freed = [int64]0; $cut = (Get-Date).AddDays(-$Days)
+    foreach ($drv in (Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue)) {
+        $rb = Join-Path $drv.DeviceID '$Recycle.Bin'
+        if (-not (Test-Path -LiteralPath $rb)) { continue }
+        foreach ($sid in (Get-ChildItem -LiteralPath $rb -Directory -Force -ErrorAction SilentlyContinue)) {
+            foreach ($i in (Get-ChildItem -LiteralPath $sid.FullName -File -Force -Filter '$I*' -ErrorAction SilentlyContinue)) {
+                if ($i.LastWriteTime -ge $cut) { continue }
+                $r = Join-Path $sid.FullName ('$R' + $i.Name.Substring(2))
+                if (Test-Path -LiteralPath $r) {
+                    $ri = Get-Item -LiteralPath $r -Force -ErrorAction SilentlyContinue
+                    $sz = if ($ri -and $ri.PSIsContainer) { Get-FolderSize $r } elseif ($ri) { $ri.Length } else { [int64]0 }
+                    try { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction Stop; $freed += $sz } catch { }
+                }
+                try { Remove-Item -LiteralPath $i.FullName -Force -ErrorAction SilentlyContinue } catch { }
+            }
+        }
+    }
+    Write-Log 'INFO' ("recycle bin: purged items deleted more than $Days days ago, reclaimed {0:N1} MB" -f ($freed/1MB))
 }
 
 function Invoke-ClearEventLogs {
@@ -580,7 +659,9 @@ if ($Mode -eq 'Heavy') {
     Invoke-Step 'Temp and log cleanup' { Invoke-TempCleanup }
     Invoke-Step 'Browser/Teams cache cleanup' { Invoke-BrowserCacheCleanup }
     Invoke-Step 'Aged logs/reports/dumps cleanup' { Invoke-AgedCleanup $RetentionDays (-not $SkipCrashDumps) }
+    Invoke-Step 'Shader/DO/thumbnail caches' { Invoke-ExtraCleanup }
     if ($ClearEventLogs) { Invoke-Step 'Clear event logs (opt-in)' { Invoke-ClearEventLogs } }
+    if ($EmptyRecycleBin) { Invoke-Step 'Empty recycle bin past retention (opt-in)' { Invoke-EmptyRecycleBin $RetentionDays } }
     Invoke-Step 'Component-store cleanup' { Invoke-ComponentCleanup }
     Invoke-Step 'SSD retrim / HDD defrag' { Invoke-SsdTrim }
     Invoke-Step 'Trim shadow copies to newest' { Invoke-ShadowTrim }
