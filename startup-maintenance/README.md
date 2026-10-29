@@ -18,6 +18,37 @@ never blocks or aborts boot.
   task in the user's context, because winget does not exist for SYSTEM.
 - `Install-TBOKMaintenance.ps1` : registers the tasks, stages the scripts to
   an admin-only `%ProgramData%\TBOK`, and runs one Heavy pass immediately.
+- `TBOK-AppDataAudit.ps1` : inventories installed apps (Add/Remove Programs
+  registry across HKLM 64/32 + every user hive, plus the Appx catalog) and
+  audits every profile's AppData for folders left by uninstalled programs.
+  Writes a ranked CSV/HTML report. Report-first.
+
+## AppData leftover audit
+
+Run standalone, elevated:
+
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\TBOK-AppDataAudit.ps1
+
+It classifies every top-level AppData folder across all profiles:
+
+- **MATCHED** : maps to an installed app; kept.
+- **CANDIDATE** : no match found. This is a heuristic and is **report only**,
+  never auto-deleted, because an AppData folder with no matching installed app
+  is frequently still wanted (portable apps, shared vendor folders, data an
+  uninstaller left on purpose). Review these by hand.
+- **ORPHAN-APPX** : a subfolder of `AppData\Local\Packages` whose package
+  family name is not in the installed Appx set. This is the one exact mapping,
+  so it is the only bucket eligible for deletion.
+
+`-DeleteHighConfidence` deletes the ORPHAN-APPX bucket only, and even then it
+skips Microsoft/framework packages, anything a running process is using, and
+anything modified within `-MinAgeDays` (default 7). Microsoft and first-party
+orphans are reported, not deleted. `Win32_Product` is deliberately not used
+(querying it runs a consistency check against every MSI and can trigger
+repairs). Reports land in `%ProgramData%\TBOK\Reports`.
+
+Deliberately NOT wired into the unattended weekly task: deletion of leftovers,
+even the high-confidence bucket, stays a manual/opt-in run.
 
 ## Install
 
