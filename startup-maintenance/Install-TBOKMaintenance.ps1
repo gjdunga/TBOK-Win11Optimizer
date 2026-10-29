@@ -10,8 +10,10 @@
 
     "TBOK Maintenance (Boot)"    At startup, 2-min delay, SYSTEM, highest.
                                  Runs TBOK-Maintenance.ps1 -Mode Light.
-    "TBOK Maintenance (Weekly)"  Weekly (default Sunday 03:00), SYSTEM, highest.
-                                 Runs TBOK-Maintenance.ps1 -Mode Heavy.
+    "TBOK Maintenance (Weekly)"  Automatic Maintenance task, SYSTEM, highest.
+                                 Weekly anchor (default Sunday 03:00) but runs
+                                 when the machine is idle and on AC, deadline
+                                 14 days. Runs TBOK-Maintenance.ps1 -Mode Heavy.
     "TBOK WinGet Update (Logon)" At logon, in the logging-on user's context
                                  (winget does not exist for SYSTEM).
                                  Runs TBOK-WinGetUpdate.ps1.
@@ -104,10 +106,22 @@ $bootTrigger = New-ScheduledTaskTrigger -AtStartup; $bootTrigger.Delay = "PT${Bo
 Register-ScheduledTask -TaskName $BootTask -Action $bootAction -Trigger $bootTrigger @common -Description 'TBOK light maintenance at startup (debloat, telemetry, Copilot/Recall, F8, network, per-user).' | Out-Null
 Write-Host "Registered: $BootTask"
 
+# The Heavy task is registered as an Automatic Maintenance task: Windows runs
+# it only when the machine is idle and on AC power, suspends it the moment the
+# user returns, resumes it at the next idle window, and if idle never comes it
+# forces the task through by the deadline (extending the maintenance window to
+# finish). Period 7 days with a 14-day deadline. The weekly trigger stays as a
+# nominal anchor and StartWhenAvailable still fires a missed run when the box
+# next wakes; the maintenance engine decides the actual moment. This is why the
+# Heavy pass must be interrupt-safe, which it is: every step is idempotent and
+# the heavy operations (defrag, file deletion) are safe to stop mid-stride.
+# A separate settings object is used so the Light/boot task is NOT made a
+# maintenance task (it must run promptly at every startup, not wait for idle).
+$weeklySettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -WakeToRun -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 3) -MaintenancePeriod (New-TimeSpan -Days 7) -MaintenanceDeadline (New-TimeSpan -Days 14)
 $weeklyAction = New-ScheduledTaskAction -Execute $PsExe -Argument "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$MaintTarget`" -Mode Heavy"
 $weeklyTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $WeeklyDay -At $WeeklyTime
-Register-ScheduledTask -TaskName $WeeklyTask -Action $weeklyAction -Trigger $weeklyTrigger @common -Description 'TBOK weekly maintenance (services, registry, gaming, cleanup, trim, shadow trim).' | Out-Null
-Write-Host "Registered: $WeeklyTask ($WeeklyDay $WeeklyTime)"
+Register-ScheduledTask -TaskName $WeeklyTask -Action $weeklyAction -Trigger $weeklyTrigger -Principal $sysPrincipal -Settings $weeklySettings -Description 'TBOK weekly maintenance as an Automatic Maintenance task (services, registry, gaming, cleanup, trim, shadow trim, enable-maintenance, ngen, health report). Runs when idle/on AC, deadline 14 days.' | Out-Null
+Write-Host "Registered: $WeeklyTask ($WeeklyDay $WeeklyTime, Automatic Maintenance, 14-day deadline)"
 
 if (-not $NoWinGetTask -and (Test-Path -LiteralPath $WinGetTarget)) {
     # Runs as whoever logs on, in their context, so winget resolves.

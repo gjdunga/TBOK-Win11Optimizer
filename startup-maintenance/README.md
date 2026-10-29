@@ -78,11 +78,38 @@ Tasks created: `TBOK Maintenance (Boot)`, `TBOK Maintenance (Weekly)`,
   is what guards against feature updates re-adding bloat.
 - **Heavy, weekly (and once at install):** Light, then services, hibernation
   policy, pagefile, system-wide registry, gaming, scheduled-task disabling,
-  restore point, temp/log/browser cleanup, aged log/report/dump cleanup,
-  regenerating caches (Delivery Optimization, GPU shader, thumbnail/icon),
-  component-store cleanup, SSD retrim, shadow-copy trim to newest, Storage
-  Sense. Opt-in extras (`-ClearEventLogs`, `-EmptyRecycleBin`) run here too
-  when their switch is set.
+  re-enabling beneficial Windows maintenance, restore point, temp/log/browser
+  cleanup, aged log/report/dump cleanup, regenerating caches (Delivery
+  Optimization, GPU shader, thumbnail/icon), component-store cleanup, .NET ngen
+  queue drain, SSD retrim, shadow-copy trim to newest, Storage Sense, and a
+  read-only health report. Opt-in extras (`-ClearEventLogs`,
+  `-EmptyRecycleBin`) run here too when their switch is set.
+
+## Scheduling: Automatic Maintenance (Heavy)
+
+The Heavy task is registered as a Windows **Automatic Maintenance** task, not a
+plain timed job. The reason is the failure mode of the obvious approach: a
+fixed Sunday 03:00 run is useless on a home PC that is asleep or off at 3am,
+and a run that fires while someone is gaming or on a call is worse than none.
+Windows already solves this, so the task hands timing to the maintenance
+engine. It runs only when the machine is idle and on AC power, suspends the
+moment the user returns, resumes at the next idle window, and if idle never
+arrives it forces the task through by a 14-day deadline (extending the
+maintenance window to finish). Period is 7 days. The weekly trigger remains as
+a nominal anchor and `StartWhenAvailable` still catches a missed run when the
+box next wakes; the engine picks the actual moment.
+
+This is safe only because the Heavy pass is interrupt-safe: every step is
+idempotent and the two heaviest operations, defrag and file deletion, are safe
+to stop mid-stride and repeat next window. The Light/boot task is deliberately
+NOT a maintenance task; it must run promptly at every startup, so it keeps the
+plain startup trigger.
+
+Defrag itself is left to Windows where possible: `Optimize-Volume` and the
+built-in `ScheduledDefrag` task are already media-aware (HDD gets defrag, an
+SSD gets TRIM/retrim and is never defragged, tiered Storage Spaces get tier
+optimization) and already idle/AC-gated. The Heavy pass re-enables that task
+if a prior debloat disabled it, rather than fighting it.
 
 ## Aged log/report/dump cleanup (Heavy)
 
@@ -195,6 +222,33 @@ data file (which keeps the original file's modified time), so a file that was
 old on disk but deleted yesterday is correctly kept. Both halves of a purged
 pair are removed together. Runs across every fixed drive's `$Recycle.Bin`.
 
+## Health report (Heavy, read-only)
+
+The Heavy pass ends by writing a read-only health snapshot to
+`%ProgramData%\TBOK\Reports` (admin-readable only). Nothing in this step
+changes system state; it exists so the servicing tech sees problems before the
+client calls.
+
+- `TBOK-Health-<host>-<stamp>.txt`:
+  - **Auto-start inventory**, report only: `Run`/`RunOnce` across HKLM and
+    every loaded user hive, the common and per-profile Startup folders, and
+    enabled logon scheduled tasks. Accumulated auto-starts are the number-one
+    cause of a sluggish home box, but they are listed, never disabled, because
+    killing a user's startup entries unattended breaks things.
+  - **Disk health and free space**: `Get-PhysicalDisk` with the SMART
+    reliability counters where the drive exposes them (wear, temperature, read
+    errors, reallocated sectors) and per-volume free space, with volumes under
+    10 percent free flagged.
+- `TBOK-SleepStudy-<host>-<stamp>.html`: `powercfg /sleepstudy` output, a power
+  and idle timeline. Empty on hardware without Modern Standby, which is normal.
+
+Also enabled in Heavy, because a performant box needs the good maintenance
+running as much as the wasteful work removed: the Automatic Maintenance master
+switch (`MaintenanceDisabled=0`), the media-aware `ScheduledDefrag` task, and
+the `.NET Framework NGEN` tasks, all re-enabled if a prior debloat turned them
+off. The `.NET` native-image queue is also drained (`ngen executeQueuedItems`)
+so managed apps start faster.
+
 ## Coverage vs the original batch
 
 Covered: F8 menu; hibernation by chassis; pagefile sizing; the service plan
@@ -206,7 +260,10 @@ policy; wasteful scheduled tasks; the full per-user list; gaming (HPET, HAGS,
 windowed-games, MMCS, chassis power plan and boost mode); cleanup (temp, logs,
 browser/Teams caches, aged logs/reports/dumps, Windows.old and upgrade
 staging, Delivery Optimization and GPU/thumbnail caches, component store, SSD
-trim, shadow trim); winget updates
+trim, shadow trim); re-enabling beneficial Windows maintenance (ScheduledDefrag,
+Automatic Maintenance, NGEN) and draining the ngen queue; a read-only health
+report (auto-start inventory, disk SMART and free space, sleep-study timeline);
+Automatic Maintenance scheduling for the Heavy pass; winget updates
 via the per-user logon task.
 
 Deliberately different from the original:

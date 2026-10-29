@@ -38,6 +38,7 @@ param(
     [ValidateSet('Light', 'Heavy')]
     [string]$Mode = 'Light',
     [string]$LogDir = (Join-Path $env:ProgramData 'TBOK\Logs'),
+    [string]$ReportDir = (Join-Path $env:ProgramData 'TBOK\Reports'),
     [int]$RetentionDays = 30,
     [switch]$SkipCrashDumps,
     [switch]$ClearEventLogs,
@@ -641,6 +642,107 @@ function Invoke-StorageSense {
     $ss='HKLM:\SOFTWARE\Policies\Microsoft\Windows\StorageSense'
     Set-Reg $ss 'AllowStorageSenseGlobal' 1; Set-Reg $ss 'AllowStorageSenseTemporaryFilesCleanup' 1
 }
+function Invoke-EnableWindowsMaintenance {
+    # Re-enable the beneficial maintenance a prior debloat pass (including the
+    # original TBOK) often disables. Keeping the good scheduled work running is
+    # as much a part of a fast box as removing the wasteful work.
+    # Automatic Maintenance master switch: the TaskScheduler\Maintenance* tasks
+    # are TrustedInstaller-owned and usually refuse Enable-ScheduledTask even for
+    # SYSTEM, so this registry/policy lever is the reliable path (0 or absent =
+    # enabled, 1 = disabled).
+    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance' 'MaintenanceDisabled' 0
+    # Media-aware defrag/trim task and the .NET native-image precompile tasks.
+    $tasks = @(
+        @{ Path='\Microsoft\Windows\Defrag\';         Name='ScheduledDefrag' }
+        @{ Path='\Microsoft\Windows\.NET Framework\'; Name='.NET Framework NGEN v4.0.30319' }
+        @{ Path='\Microsoft\Windows\.NET Framework\'; Name='.NET Framework NGEN v4.0.30319 64' }
+    )
+    foreach ($t in $tasks) {
+        try {
+            $st = Get-ScheduledTask -TaskPath $t.Path -TaskName $t.Name -ErrorAction Stop
+            if ($st.State -eq 'Disabled') { Enable-ScheduledTask -TaskPath $t.Path -TaskName $t.Name -ErrorAction Stop | Out-Null; Write-Log 'INFO' "enabled task $($t.Name)" }
+        } catch { Write-Log 'WARN' "could not enable $($t.Name): $($_.Exception.Message)" }
+    }
+}
+function Invoke-NgenQueue {
+    # Drain the .NET native-image precompile queue so managed apps start faster.
+    # The 32-bit ngen only exists on 64-bit Windows; both are attempted.
+    foreach ($ng in "$env:SystemRoot\Microsoft.NET\Framework64\v4.0.30319\ngen.exe","$env:SystemRoot\Microsoft.NET\Framework\v4.0.30319\ngen.exe") {
+        if (Test-Path -LiteralPath $ng) {
+            try { & $ng executeQueuedItems *> $null; Write-Log 'INFO' "ngen queue drained ($(Split-Path (Split-Path $ng -Parent) -Leaf))" } catch { Write-Log 'WARN' "ngen: $($_.Exception.Message)" }
+        }
+    }
+}
+function Invoke-HealthReport {
+    # Read-only. Writes a weekly health snapshot (auto-start entries, disk SMART
+    # and free space) plus a powercfg sleep-study timeline to the report folder.
+    # Nothing here changes system state; startup entries are reported, never
+    # disabled, because killing a user's auto-starts unattended breaks things.
+    param([string]$ReportDir)
+    try { [void][System.IO.Directory]::CreateDirectory($ReportDir) } catch { }
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $out = Join-Path $ReportDir ("TBOK-Health-{0}-{1}.txt" -f $env:COMPUTERNAME, $stamp)
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("TBOK health report  $(Get-Date -Format 'u')  $env:COMPUTERNAME")
+    $lines.Add('')
+
+    $lines.Add('== Auto-start entries (review only; nothing is changed) ==')
+    foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run','HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce','HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Run','HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\RunOnce') {
+        if (Test-Path $k) {
+            $p = Get-ItemProperty -Path $k -ErrorAction SilentlyContinue
+            foreach ($n in ($p.PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' })) { $lines.Add(("  [HKLM] {0} = {1}" -f $n.Name, $n.Value)) }
+        }
+    }
+    foreach ($sidKey in (Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'S-1-5-21' -and $_.Name -notlike '*_Classes' })) {
+        foreach ($sub in 'Run','RunOnce') {
+            $uk = "Registry::$($sidKey.Name)\SOFTWARE\Microsoft\Windows\CurrentVersion\$sub"
+            if (Test-Path $uk) {
+                $p = Get-ItemProperty -Path $uk -ErrorAction SilentlyContinue
+                foreach ($n in ($p.PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' })) { $lines.Add(("  [{0}] {1} = {2}" -f $sidKey.PSChildName, $n.Name, $n.Value)) }
+            }
+        }
+    }
+    $startupDirs = @("$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup")
+    Get-ChildItem "$env:SystemDrive\Users" -Directory -ErrorAction SilentlyContinue | ForEach-Object { $startupDirs += (Join-Path $_.FullName 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup') }
+    foreach ($d in $startupDirs) {
+        if (Test-Path -LiteralPath $d) {
+            foreach ($f in (Get-ChildItem -LiteralPath $d -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'desktop.ini' })) { $lines.Add(("  [StartupFolder] {0}" -f $f.FullName)) }
+        }
+    }
+    try {
+        foreach ($lt in (Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.State -ne 'Disabled' -and ($_.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' }) })) {
+            $lines.Add(("  [LogonTask] {0}{1}" -f $lt.TaskPath, $lt.TaskName))
+        }
+    } catch { }
+    $lines.Add('')
+
+    $lines.Add('== Disk health and free space ==')
+    try {
+        foreach ($pd in (Get-PhysicalDisk -ErrorAction Stop)) {
+            $rc = $null; try { $rc = $pd | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue } catch { }
+            $rcStr = ''
+            if ($rc) { $rcStr = " | wear $($rc.Wear)% | temp $($rc.Temperature)C | readErr $($rc.ReadErrorsTotal) | reallocated $($rc.ReallocatedSectors)" }
+            $lines.Add(("  Disk: {0} | {1} | {2:N0} GB | health {3}{4}" -f $pd.FriendlyName, $pd.MediaType, ($pd.Size/1GB), $pd.HealthStatus, $rcStr))
+        }
+    } catch { $lines.Add("  (Get-PhysicalDisk unavailable: $($_.Exception.Message))") }
+    foreach ($v in (Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -and $_.Size })) {
+        $pct = [math]::Round(($v.SizeRemaining/$v.Size)*100, 1)
+        $flag = if ($pct -lt 10) { '  <-- LOW' } else { '' }
+        $lines.Add(("  Vol {0}: {1:N1} GB free of {2:N1} GB ({3}% free) health {4}{5}" -f $v.DriveLetter, ($v.SizeRemaining/1GB), ($v.Size/1GB), $pct, $v.HealthStatus, $flag))
+    }
+    $lines.Add('')
+
+    try { Set-Content -LiteralPath $out -Value $lines -Encoding ASCII; Write-Log 'INFO' "health report written: $out" } catch { Write-Log 'WARN' "health report write: $($_.Exception.Message)" }
+
+    # Sleep-study timeline (power/idle history), report only. Empty on hardware
+    # without Modern Standby, which is normal, not an error.
+    $sleep = Join-Path $ReportDir ("TBOK-SleepStudy-{0}-{1}.html" -f $env:COMPUTERNAME, $stamp)
+    try {
+        & powercfg.exe /sleepstudy /output "$sleep" *> $null
+        if (Test-Path -LiteralPath $sleep) { Write-Log 'INFO' "sleep study written: $sleep" }
+        else { Write-Log 'INFO' 'sleep study produced no output (no Modern Standby on this hardware)' }
+    } catch { Write-Log 'WARN' "sleepstudy: $($_.Exception.Message)" }
+}
 
 # ---------------------------------------------------------------- main
 $ctx = Get-Context
@@ -665,6 +767,7 @@ if ($Mode -eq 'Heavy') {
     Invoke-Step 'Pagefile sizing' { Invoke-Pagefile $ctx }
     Invoke-Step 'Gaming tweaks (chassis-aware)' { Invoke-Gaming $ctx }
     Invoke-Step 'Disable wasteful scheduled tasks' { Invoke-DisableTasks }
+    Invoke-Step 'Enable beneficial Windows maintenance' { Invoke-EnableWindowsMaintenance }
     Invoke-Step 'Restore point (throttled)' { New-RestorePointThrottled }
     Invoke-Step 'Temp and log cleanup' { Invoke-TempCleanup }
     Invoke-Step 'Browser/Teams cache cleanup' { Invoke-BrowserCacheCleanup }
@@ -673,9 +776,11 @@ if ($Mode -eq 'Heavy') {
     if ($ClearEventLogs) { Invoke-Step 'Clear event logs (opt-in)' { Invoke-ClearEventLogs } }
     if ($EmptyRecycleBin) { Invoke-Step 'Empty recycle bin past retention (opt-in)' { Invoke-EmptyRecycleBin $RetentionDays } }
     Invoke-Step 'Component-store cleanup' { Invoke-ComponentCleanup }
+    Invoke-Step 'Drain .NET ngen queue' { Invoke-NgenQueue }
     Invoke-Step 'SSD retrim / HDD defrag' { Invoke-SsdTrim }
     Invoke-Step 'Trim shadow copies to newest' { Invoke-ShadowTrim }
     Invoke-Step 'Ensure Storage Sense on' { Invoke-StorageSense }
+    Invoke-Step 'Health report (startup/disk/sleep)' { Invoke-HealthReport $ReportDir }
 }
 Write-Log 'INFO' "done Mode=$Mode warnings=$script:Warnings"
 exit 0
