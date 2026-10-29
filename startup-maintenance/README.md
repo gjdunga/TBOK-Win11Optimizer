@@ -40,10 +40,11 @@ It classifies every top-level AppData folder across all profiles:
   family name is not in the installed Appx set. This is the one exact mapping,
   so it is the only bucket eligible for deletion.
 
-`-DeleteHighConfidence` deletes the ORPHAN-APPX bucket only, and even then it
+`-Delete` deletes the ORPHAN-APPX bucket only (alias `-DeleteHighConfidence`), and even then it
 skips Microsoft/framework packages, anything a running process is using, and
 anything modified within `-MinAgeDays` (default 7). Microsoft and first-party
-orphans are reported, not deleted. `Win32_Product` is deliberately not used
+orphans are reported, not deleted. Every deletion is appended to a log under
+`%ProgramData%\TBOK\Logs`. Run without `-Delete` to report only. `Win32_Product` is deliberately not used
 (querying it runs a consistency check against every MSI and can trigger
 repairs). Reports land in `%ProgramData%\TBOK\Reports`.
 

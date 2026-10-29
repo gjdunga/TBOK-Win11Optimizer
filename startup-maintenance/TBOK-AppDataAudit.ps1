@@ -24,9 +24,11 @@
   Even ORPHAN-APPX deletion excludes Microsoft/framework packages, anything a
   running process is using, and anything modified within -MinAgeDays.
 
-.PARAMETER DeleteHighConfidence
-  Delete the ORPHAN-APPX bucket (third-party Store-app data only). Heuristic
-  CANDIDATE folders are never deleted regardless of this switch.
+.PARAMETER Delete
+  Without it, the tool only reports. With it, the ORPHAN-APPX bucket
+  (third-party Store-app data only) is deleted and every removal is written to
+  an appendable deletion log under the Logs folder. Heuristic CANDIDATE folders
+  are never deleted regardless of this switch. (Alias: -DeleteHighConfidence.)
 
 .PARAMETER MinAgeDays       Skip anything modified within this many days (default 7).
 .PARAMETER ReportDir        Where to write the CSV/HTML report.
@@ -38,9 +40,10 @@
 #>
 [CmdletBinding()]
 param(
-    [switch]$DeleteHighConfidence,
+    [Alias('DeleteHighConfidence')][switch]$Delete,
     [int]$MinAgeDays = 7,
     [string]$ReportDir = (Join-Path $env:ProgramData 'TBOK\Reports'),
+    [string]$LogDir = (Join-Path $env:ProgramData 'TBOK\Logs'),
     [switch]$CurrentUserOnly,
     [switch]$WhatIfOnly
 )
@@ -48,11 +51,16 @@ param(
 $ErrorActionPreference = 'Stop'
 $cutoff = (Get-Date).AddDays(-$MinAgeDays)
 try { [void][System.IO.Directory]::CreateDirectory($ReportDir) } catch { }
+try { [void][System.IO.Directory]::CreateDirectory($LogDir) } catch { }
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $csvPath  = Join-Path $ReportDir ("AppDataAudit-{0}-{1}.csv"  -f $env:COMPUTERNAME, $stamp)
 $htmlPath = Join-Path $ReportDir ("AppDataAudit-{0}-{1}.html" -f $env:COMPUTERNAME, $stamp)
+# Dedicated, appendable deletion log, written only when -Delete is used.
+$delLog   = Join-Path $LogDir ("AppDataAudit-deletions-{0}.log" -f $env:COMPUTERNAME)
 $rows = New-Object System.Collections.ArrayList
 function Log($m){ Write-Output ('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $m) }
+function Add-DelLog($m){ try { Add-Content -LiteralPath $delLog -Value ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m) -Encoding UTF8 } catch { } }
+if ($Delete -and -not $WhatIfOnly) { Add-DelLog ("==== run start on {0} as {1}; MinAgeDays={2} CurrentUserOnly={3} ====" -f $env:COMPUTERNAME, $env:USERNAME, $MinAgeDays, [bool]$CurrentUserOnly) }
 
 # ---- normalization + install index ----------------------------------------
 function Get-Norm([string]$s){ if(-not $s){return ''}; ($s.ToLowerInvariant() -replace '[^a-z0-9]','') }
@@ -169,9 +177,18 @@ foreach ($prof in $profiles) {
                     $size = Get-FolderSize $pkg.FullName
                     $action = 'Reported'
                     $eligible = (-not $fw) -and (-not $inUse) -and (-not $recent)
-                    if ($DeleteHighConfidence -and $eligible) {
+                    if ($Delete -and $eligible) {
                         if ($WhatIfOnly) { $action = 'WouldDelete' }
-                        else { try { Remove-Item -LiteralPath $pkg.FullName -Recurse -Force -ErrorAction Stop; $action='Deleted'; $deleted++; $reclaim+=$size } catch { $action='DeleteFailed:'+$_.Exception.Message } }
+                        else {
+                            try {
+                                Remove-Item -LiteralPath $pkg.FullName -Recurse -Force -ErrorAction Stop
+                                $action='Deleted'; $deleted++; $reclaim+=$size
+                                Add-DelLog ("DELETED  {0}  profile={1}  {2:N1} MB  lastwrite={3}" -f $pkg.FullName, $prof.Name, ($size/1MB), $pkg.LastWriteTime.ToString('yyyy-MM-dd'))
+                            } catch {
+                                $action='DeleteFailed:'+$_.Exception.Message
+                                Add-DelLog ("FAILED   {0}  profile={1}  {2}" -f $pkg.FullName, $prof.Name, $_.Exception.Message)
+                            }
+                        }
                     }
                     [void]$rows.Add([pscustomobject]@{
                         Profile=$prof.Name; Root=$root; Folder="Packages\$pfn"; Class='ORPHAN-APPX'
@@ -219,5 +236,10 @@ $cand   = @($rows | Where-Object Class -eq 'CANDIDATE')
 Log ("rows: {0}  orphan-appx: {1}  candidates(review): {2}  deleted: {3}  reclaimed: {4} MB" -f $rows.Count,$orphan.Count,$cand.Count,$deleted,[math]::Round($reclaim/1MB,1))
 Log "CSV:  $csvPath"
 Log "HTML: $htmlPath"
-if (-not $DeleteHighConfidence) { Log 'report only (no deletions). Pass -DeleteHighConfidence to remove the ORPHAN-APPX bucket.' }
+if (-not $Delete) {
+    Log 'report only (no deletions). Pass -Delete to remove the ORPHAN-APPX bucket.'
+} else {
+    if (-not $WhatIfOnly) { Add-DelLog ("==== run end: deleted {0} folder(s), {1:N1} MB ====" -f $deleted, ($reclaim/1MB)) }
+    Log "deletion log: $delLog"
+}
 exit 0
