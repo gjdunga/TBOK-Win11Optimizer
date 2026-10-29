@@ -51,6 +51,12 @@ repairs). Reports land in `%ProgramData%\TBOK\Reports`.
 Deliberately NOT wired into the unattended weekly task: deletion of leftovers,
 even the high-confidence bucket, stays a manual/opt-in run.
 
+The component store (WinSxS) is handled here too: report mode runs the
+read-only `DISM /AnalyzeComponentStore` and includes its output (and whether
+cleanup is recommended) in the report; `-Delete` also runs
+`StartComponentCleanup` (never `/ResetBase`, so installed updates stay
+removable), logs the result, and shows a before/after analysis.
+
 ## Install
 
 From an elevated PowerShell:

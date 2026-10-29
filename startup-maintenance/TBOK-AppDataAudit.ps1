@@ -25,10 +25,13 @@
   running process is using, and anything modified within -MinAgeDays.
 
 .PARAMETER Delete
-  Without it, the tool only reports. With it, the ORPHAN-APPX bucket
-  (third-party Store-app data only) is deleted and every removal is written to
-  an appendable deletion log under the Logs folder. Heuristic CANDIDATE folders
-  are never deleted regardless of this switch. (Alias: -DeleteHighConfidence.)
+  Without it, the tool only reports (and runs the read-only DISM component
+  store analysis). With it, the ORPHAN-APPX bucket (third-party Store-app data
+  only) is deleted, the Windows component store is cleaned with DISM
+  StartComponentCleanup (no /ResetBase, so updates stay removable), and every
+  removal plus the cleanup result is written to an appendable deletion log
+  under the Logs folder. Heuristic CANDIDATE folders are never deleted
+  regardless of this switch. (Alias: -DeleteHighConfidence.)
 
 .PARAMETER MinAgeDays       Skip anything modified within this many days (default 7).
 .PARAMETER ReportDir        Where to write the CSV/HTML report.
@@ -132,6 +135,29 @@ function Get-FolderSize([string]$path){
 }
 function ConvertTo-HtmlText([string]$s){ ($s -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;') }
 
+# Windows component store (WinSxS). Analyze is read-only and always safe to
+# run; cleanup (StartComponentCleanup, never /ResetBase so updates stay
+# removable) runs only with -Delete.
+function Invoke-ComponentStore([bool]$DoClean,[bool]$WhatIf){
+    $dism = Join-Path $env:SystemRoot 'System32\Dism.exe'
+    $res = [pscustomobject]@{ Before=''; After=''; Recommended='Unknown'; CleanExit=$null; Ran=$false }
+    try {
+        $before = & $dism /Online /Cleanup-Image /AnalyzeComponentStore 2>&1 | ForEach-Object { $_.ToString() }
+        $res.Before = ($before -join "`n")
+        $rec = $before | Where-Object { $_ -match 'Cleanup Recommended' } | Select-Object -Last 1
+        if ($rec) { $res.Recommended = (($rec -split ':')[-1]).Trim() }   # best-effort; label is localized
+    } catch { Log "component store analyze failed: $($_.Exception.Message)" }
+    if ($DoClean -and -not $WhatIf) {
+        try {
+            & $dism /Online /Cleanup-Image /StartComponentCleanup 2>&1 | ForEach-Object { $_.ToString() } | Out-Null
+            $res.CleanExit = $LASTEXITCODE; $res.Ran = $true
+            $after = & $dism /Online /Cleanup-Image /AnalyzeComponentStore 2>&1 | ForEach-Object { $_.ToString() }
+            $res.After = ($after -join "`n")
+        } catch { Log "component store cleanup failed: $($_.Exception.Message)" }
+    }
+    return $res
+}
+
 # ---- main ------------------------------------------------------------------
 Log 'building installed-app index'
 $idx = Get-InstalledIndex
@@ -221,6 +247,17 @@ foreach ($prof in $profiles) {
     }
 }
 
+# ---- component store (machine-wide; analyze always, clean only with -Delete)
+Log 'analyzing Windows component store (DISM)'
+$cs = Invoke-ComponentStore ([bool]$Delete) ([bool]$WhatIfOnly)
+[void]$rows.Add([pscustomobject]@{
+    Profile='(machine)'; Root='ComponentStore'; Folder='WinSxS (AnalyzeComponentStore)'; Class='COMPONENT-STORE'
+    Confidence=("CleanupRecommended=" + $cs.Recommended); MatchedApp=''; SizeMB=''
+    LastWrite=(Get-Date -Format 'yyyy-MM-dd')
+    Action=$(if($cs.Ran){'cleanup exit ' + $cs.CleanExit} elseif($Delete -and $WhatIfOnly){'WouldClean'} else{'analyzed'})
+})
+if ($cs.Ran) { Add-DelLog ("COMPONENTSTORE StartComponentCleanup exit={0}; cleanup-recommended(before)={1}" -f $cs.CleanExit, $cs.Recommended) }
+
 # ---- output ----------------------------------------------------------------
 $sorted = $rows | Sort-Object @{e={switch($_.Class){'ORPHAN-APPX'{0}'CANDIDATE'{1}default{2}}}}, @{e={-$_.SizeMB}}
 $sorted | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
@@ -228,7 +265,12 @@ $style = "body{font-family:Segoe UI,Arial,sans-serif;font-size:13px} table{borde
 $html = "<html><head><meta charset='utf-8'><style>$style</style></head><body><h2>TBOK AppData audit: $env:COMPUTERNAME $stamp</h2>"
 $html += "<p>ORPHAN-APPX = unmatched Store-app data (high confidence). CANDIDATE = heuristic, review only, never auto-deleted. MATCHED = kept.</p><table><tr><th>Profile</th><th>Root</th><th>Folder</th><th>Class</th><th>Confidence</th><th>SizeMB</th><th>LastWrite</th><th>Action</th></tr>"
 foreach ($r in $sorted) { $cls=($r.Class -replace '[^A-Za-z]',''); $html += "<tr class='$cls'><td>$($r.Profile)</td><td>$($r.Root)</td><td>$(ConvertTo-HtmlText $r.Folder)</td><td>$($r.Class)</td><td>$($r.Confidence)</td><td>$($r.SizeMB)</td><td>$($r.LastWrite)</td><td>$($r.Action)</td></tr>" }
-$html += "</table></body></html>"
+$html += "</table>"
+$html += "<h3>Windows component store (DISM)</h3>"
+$html += "<p>Cleanup recommended (before): <b>$(ConvertTo-HtmlText $cs.Recommended)</b>$(if($cs.Ran){"; StartComponentCleanup exit $($cs.CleanExit)"}elseif($Delete -and $WhatIfOnly){'; would run StartComponentCleanup'}else{'; analyze only (pass -Delete to clean)'})</p>"
+$html += "<h4>AnalyzeComponentStore (before)</h4><pre>$(ConvertTo-HtmlText $cs.Before)</pre>"
+if ($cs.Ran) { $html += "<h4>AnalyzeComponentStore (after cleanup)</h4><pre>$(ConvertTo-HtmlText $cs.After)</pre>" }
+$html += "</body></html>"
 try { Set-Content -LiteralPath $htmlPath -Value $html -Encoding UTF8 } catch { }
 
 $orphan = @($rows | Where-Object Class -eq 'ORPHAN-APPX')
